@@ -1,5 +1,8 @@
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple, Type
+from functools import reduce
+from operator import add
 import math
+from enum import Enum, member
 
 import torch
 from torch import distributions, nn, Tensor
@@ -89,7 +92,93 @@ class Composer(nn.Sequential):
         return self.decode(self.encode(input))
 
 
+class IgnoredModule(nn.Module):
+    def __init__(self, name, module):
+        super().__init__()
+        self.add_module(name, module)
+
+    def forward(self, *args, **kwargs):
+        return 0.0
+
+
+class LossTerm(NamedTuple):
+    name: str
+    type: "LossType"
+    weight: float | Callable[[], float] | Callable[[Any], float]
+    module: nn.Module
+    premodule: Callable[[Any, Any], Any]
+
+    def unwrap_weight(self, state: Any | None = None) -> float:
+        match self:
+            case LossTerm(type=LossType.Static | LossType.Ignored, weight=value):
+                return value  # type: ignore[return-value]
+            case LossTerm(type=LossType.Dynamic, weight=value):
+                return value() if state is None else value(state)  # type: ignore[call-arg, operator]
+            case _:
+                raise NotImplementedError
+
+
+def create_loss_term(
+    default_weight: float | None = None, ignored_module: Type[IgnoredModule] | None = None
+) -> Callable:
+    def init_loss_term(
+        loss_type: "LossType",
+        name: str,
+        weight: float | Callable[[], float] | Callable[[Any], float],
+        module: nn.Module,
+        premodule: Callable[[Any, Any], Any],
+    ) -> LossTerm:
+        return LossTerm(
+            name,
+            loss_type,
+            default_weight if default_weight is not None else weight,
+            ignored_module(name, module) if ignored_module is not None else module,
+            premodule,
+        )
+
+    return init_loss_term
+
+
+class LossType(Enum):
+    Static = member(create_loss_term())
+    Dynamic = member(create_loss_term())
+    Ignored = member(create_loss_term(0.0, IgnoredModule))
+
+    def __call__(
+        self,
+        name: str,
+        weight: float | Callable[[], float] | Callable[[Any], float],
+        module: nn.Module,
+        premodule: Callable[[Any, Any], Any],
+    ) -> LossTerm:
+        return self.value(self, name, weight, module, premodule)
+
+
 class LossComposer(nn.ModuleDict):
+    def __init__(self, loss_terms: list[LossTerm]) -> None:
+        super().__init__({lt.name: lt.module for lt in loss_terms})
+        self.loss_terms = {lt.name: lt for lt in loss_terms}
+
+    def _parallel_forward(self, inputs, targets) -> dict[str, Tensor]:
+        return {
+            loss_term_name: loss_module(*self.loss_terms[loss_term_name].premodule(inputs, targets))
+            for loss_term_name, loss_module in self.items()
+        }
+
+    def _apply_weights(self, loss_values: dict[str, Tensor], state=None) -> dict[str, Tensor]:
+        return {
+            loss_term_name: self.loss_terms[loss_term_name].unwrap_weight(state) * loss_value
+            for loss_term_name, loss_value in loss_values.items()
+        }
+
+    def _reduce(self, weighted_loss_values: dict[str, Tensor]) -> Tensor:
+        return reduce(add, weighted_loss_values.values(), 0.0)  # type: ignore[return-value]
+
+    def forward(self, inputs, targets, state=None) -> Tensor:
+        return self._reduce(self._apply_weights(self._parallel_forward(inputs, targets), state))
+
+
+class LegacyLossComposer(nn.ModuleDict):
     def __init__(
         self,
         modules: dict[str, nn.Module] | None = None,
